@@ -49,6 +49,31 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(msg.encode("utf-8"))
             return
 
+        if "action=diag" in self.path:
+            import traceback
+            import image_processor
+            diag_res = {}
+            try:
+                diag_res["models_dir_exists"] = os.path.exists(image_processor.models_dir)
+                diag_res["model_file_exists"] = os.path.exists(os.path.join(image_processor.models_dir, "u2netp.onnx"))
+                session = image_processor.get_rembg_session()
+                diag_res["session_is_none"] = (session is None)
+                if session is not None:
+                    from PIL import Image
+                    test_img = Image.new("RGB", (50, 50), (255, 255, 255))
+                    res = image_processor.remove_background(test_img)
+                    diag_res["test_remove_success"] = True
+                    diag_res["result_size"] = res.size
+            except Exception as e:
+                diag_res["error"] = str(e)
+                diag_res["traceback"] = traceback.format_exc()
+
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(diag_res, indent=2).encode("utf-8"))
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
