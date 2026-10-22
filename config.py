@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # Загружаем .env файл при локальной разработке
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "6581589766:AAEJvUMBzY9AnsYseib68-EJarzTtRTxPzE").strip()
 
 # URL для вебхука на Vercel (например: https://your-project.vercel.app/api)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()

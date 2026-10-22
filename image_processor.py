@@ -244,3 +244,41 @@ def process_image(
     else:  # по умолчанию PNG
         out_bytes = to_png_bytes(rgba_result)
         return out_bytes, "no_bg.png", "image/png"
+
+
+def convert_format(
+    image_bytes: bytes,
+    target_format: str
+) -> Tuple[bytes, str, str]:
+    """
+    Конвертирует исходное изображение в запрошенный формат (svg, png, jpeg) БЕЗ удаления фона.
+    """
+    input_img = Image.open(io.BytesIO(image_bytes))
+    fmt = target_format.lower().strip().lstrip("/")
+
+    if fmt == "svg":
+        if not HAS_VTRACER:
+            raise RuntimeError("vtracer не установлен для векторизации SVG.")
+        buf = io.BytesIO()
+        input_img.save(buf, format="PNG")
+        svg_str = vtracer.convert_raw_image_to_svg(
+            buf.getvalue(),
+            img_format="png",
+            colormode="color",
+            hierarchical="stacked",
+            mode="spline",
+            filter_speckle=4,
+            color_precision=6,
+            layer_difference=16,
+        )
+        return svg_str.encode("utf-8"), "image.svg", "image/svg+xml"
+    elif fmt in ("jpg", "jpeg"):
+        rgb = input_img.convert("RGB")
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=95)
+        return buf.getvalue(), "image.jpg", "image/jpeg"
+    else:  # png
+        buf = io.BytesIO()
+        input_img.save(buf, format="PNG")
+        return buf.getvalue(), "image.png", "image/png"
+
