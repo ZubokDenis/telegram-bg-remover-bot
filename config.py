@@ -16,5 +16,9 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 # Секретный токен для защиты вебхука от посторонних запросов (опционально)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tg-bot-secret").strip()
 
+# Токен Hugging Face для бесплатной нейросети RMBG-1.4 (опционально)
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+
 # Режим работы по умолчанию: 'auto', 'floodfill', 'grabcut'
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", "auto").strip()
+

@@ -5,10 +5,14 @@
 
 import os
 import io
+import time
 import logging
 from typing import Tuple, Optional
+import requests
 import numpy as np
 from PIL import Image, ImageFilter
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +25,40 @@ except ImportError:
     logger.warning("vtracer не обнаружен, векторизация SVG будет недоступна")
 
 
-def remove_background(
+def remove_background_hf(image_bytes: bytes, token: str) -> Optional[Image.Image]:
+    """
+    Отправляет изображение в официальный бесплатный Serverless-эндпоинт модели briaai/RMBG-1.4 на Hugging Face.
+    Возвращает изображение высочайшего студийного качества с прозрачным альфа-каналом.
+    """
+    urls = [
+        "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4",
+        "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
+    ]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/octet-stream",
+    }
+
+    for url in urls:
+        try:
+            r = requests.post(url, headers=headers, data=image_bytes, timeout=30)
+            if r.status_code == 200:
+                return Image.open(io.BytesIO(r.content)).convert("RGBA")
+            elif r.status_code == 503:
+                # Если модель на сервере Hugging Face прогревается (cold start)
+                time.sleep(2)
+                r = requests.post(url, headers=headers, data=image_bytes, timeout=30)
+                if r.status_code == 200:
+                    return Image.open(io.BytesIO(r.content)).convert("RGBA")
+            else:
+                logger.warning(f"Hugging Face ({url}) статус {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Ошибка запроса к {url}: {e}")
+
+    return None
+
+
+def remove_background_local(
     pil_image: Image.Image,
     threshold: float = 38.0
 ) -> Image.Image:
@@ -70,6 +107,26 @@ def remove_background(
     result = rgb.copy()
     result.putalpha(alpha_final)
     return result
+
+
+def remove_background(pil_image: Image.Image) -> Image.Image:
+    """
+    Главная функция вырезания фона:
+    1. Если задан HF_TOKEN, использует передовую нейросеть briaai/RMBG-1.4 (студийное качество 10/10).
+    2. В случае отсутствия токена или сетевой ошибки бесшовно переключается на локальный алгоритм.
+    """
+    if config.HF_TOKEN:
+        try:
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            hf_res = remove_background_hf(buf.getvalue(), config.HF_TOKEN)
+            if hf_res is not None:
+                return hf_res
+        except Exception as e:
+            logger.warning(f"Ошибка при вызове нейросети RMBG: {e}")
+
+    return remove_background_local(pil_image)
+
 
 
 def to_png_bytes(rgba_img: Image.Image) -> bytes:
