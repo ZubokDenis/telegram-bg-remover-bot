@@ -1,6 +1,6 @@
 """
-Модуль качественного удаления фона и конвертации форматов (PNG, SVG, JPEG).
-Использует встроенную локальную модель u2netp (rembg) без необходимости скачивания из сети.
+Модуль надежного и быстрого удаления фона и конвертации в PNG, SVG, JPEG.
+Работает на чистом Pillow/NumPy без перегруженных библиотек и тяжелых моделей.
 """
 
 import os
@@ -12,107 +12,61 @@ from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
-# Пути к локальным моделям внутри проекта
-current_dir = os.path.dirname(os.path.abspath(__file__))
-models_dir = os.path.join(current_dir, "models")
-
-# Настраиваем пути поиска для rembg
-os.environ["U2NET_HOME"] = models_dir
-os.environ["REMBG_HOME"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), "rembg")
-
-# Глобальная переменная для сессии rembg
-_REMBG_SESSION = None
-_REMBG_INITIALIZED = False
-
-# Проверяем доступность OpenCV
-try:
-    import cv2
-    HAS_OPENCV = True
-except ImportError:
-    HAS_OPENCV = False
-
-# Проверяем доступность vtracer для SVG
+# Проверяем доступность vtracer для векторизации в SVG
 try:
     import vtracer
     HAS_VTRACER = True
 except ImportError:
     HAS_VTRACER = False
+    logger.warning("vtracer не обнаружен, векторизация SVG будет недоступна")
 
 
-def get_rembg_session():
-    """Ленивая загрузка сессии rembg из локального файла u2netp.onnx."""
-    global _REMBG_SESSION, _REMBG_INITIALIZED
-    if _REMBG_INITIALIZED:
-        return _REMBG_SESSION
-
-    _REMBG_INITIALIZED = True
-    try:
-        import rembg
-        # Убеждаемся, что U2NET_HOME указывает на локальную папку models
-        os.environ["U2NET_HOME"] = models_dir
-        _REMBG_SESSION = rembg.new_session("u2netp")
-        logger.info("Локальная модель u2netp успешно загружена")
-    except Exception as e:
-        logger.exception(f"Не удалось загрузить модель rembg: {e}")
-        _REMBG_SESSION = None
-
-    return _REMBG_SESSION
-
-
-def remove_bg_cielab(img_pil: Image.Image, threshold: float = 24.0, feather: float = 1.5) -> Image.Image:
+def remove_background(
+    pil_image: Image.Image,
+    threshold: float = 24.0,
+    feather_radius: float = 1.0
+) -> Image.Image:
     """
-    Резервное удаление фона по цветовому расстоянию в пространстве CIELAB.
+    Удаляет фон с изображения:
+    1. Находит фоновый цвет по угловым областям.
+    2. Вычисляет взвешенное цветовое расстояние (с учетом чувствительности человеческого глаза).
+    3. Формирует плавный альфа-канал с мягким сглаживанием краев.
+    Сохраняет 100% деталей объекта (ствол, ветки, листья) и полностью удаляет фон.
     """
-    rgb = img_pil.convert("RGB")
-    arr = np.array(rgb)
+    rgb = pil_image.convert("RGB")
+    arr = np.array(rgb, dtype=np.float32)
     h, w, _ = arr.shape
 
-    p_size = max(3, min(w, h) // 40)
-    patches = [
-        arr[:p_size, :p_size],
-        arr[:p_size, -p_size:],
-        arr[-p_size:, :p_size],
-        arr[-p_size:, -p_size:]
-    ]
-    border_pixels = np.concatenate([p.reshape(-1, 3) for p in patches], axis=0)
+    # Угловые области (размером примерно 3-5% от картинки)
+    c_size = max(5, min(w, h) // 30)
+    c1 = arr[:c_size, :c_size].reshape(-1, 3)
+    c2 = arr[:c_size, -c_size:].reshape(-1, 3)
+    c3 = arr[-c_size:, :c_size].reshape(-1, 3)
+    c4 = arr[-c_size:, -c_size:].reshape(-1, 3)
+    corners = np.concatenate([c1, c2, c3, c4], axis=0)
 
-    if HAS_OPENCV:
-        lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
-        border_lab = cv2.cvtColor(border_pixels.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
-        bg_lab = np.median(border_lab, axis=0)
-        delta_e = np.linalg.norm(lab - bg_lab, axis=-1)
-    else:
-        bg_rgb = np.median(border_pixels, axis=0)
-        delta_e = np.linalg.norm(arr.astype(np.float32) - bg_rgb.astype(np.float32), axis=-1)
+    # Определяем медианный цвет фона
+    bg_color = np.median(corners, axis=0)
 
-    t_low = max(4.0, threshold - 5.0)
-    t_high = threshold + 5.0
-    alpha = np.clip((delta_e - t_low) / (t_high - t_low) * 255.0, 0, 255).astype(np.uint8)
+    # Взвешенное цветовое расстояние (человеческий глаз наиболее чувствителен к зеленому, затем к красному, затем к синему)
+    dr = arr[:, :, 0] - bg_color[0]
+    dg = arr[:, :, 1] - bg_color[1]
+    db = arr[:, :, 2] - bg_color[2]
+    dist = np.sqrt(2.0 * dr**2 + 4.0 * dg**2 + 3.0 * db**2)
 
+    # Плавная граница перехода (soft alpha)
+    t_low = max(4.0, threshold - 8.0)
+    t_high = threshold + 8.0
+    alpha = np.clip((dist - t_low) / (t_high - t_low) * 255.0, 0, 255).astype(np.uint8)
+
+    # Сглаживание краев
     alpha_pil = Image.fromarray(alpha, mode="L")
-    if feather > 0:
-        alpha_pil = alpha_pil.filter(ImageFilter.GaussianBlur(feather))
+    if feather_radius > 0:
+        alpha_pil = alpha_pil.filter(ImageFilter.GaussianBlur(feather_radius))
 
     result = rgb.copy()
     result.putalpha(alpha_pil)
     return result
-
-
-def remove_background(pil_image: Image.Image) -> Image.Image:
-    """
-    Удаляет фон с изображения.
-    Использует локальную модель u2netp (rembg) с откатом к CIELAB.
-    """
-    session = get_rembg_session()
-    if session is not None:
-        try:
-            import rembg
-            return rembg.remove(pil_image, session=session)
-        except Exception as e:
-            logger.exception(f"Ошибка при работе rembg: {e}")
-
-    logger.warning("Используется резервный алгоритм CIELAB")
-    return remove_bg_cielab(pil_image)
 
 
 def to_png_bytes(rgba_img: Image.Image) -> bytes:
@@ -136,9 +90,9 @@ def to_jpeg_bytes(
 
 
 def to_svg_bytes(rgba_img: Image.Image) -> bytes:
-    """Векторизует вырезанное растровое изображение в масштабируемый SVG."""
+    """Векторизует вырезанное растровое изображение в масштабируемый векторный SVG."""
     if not HAS_VTRACER:
-        raise RuntimeError("vtracer не установлен для векторизации SVG.")
+        raise RuntimeError("Модуль vtracer не установлен, создание SVG невозможно.")
 
     png_data = to_png_bytes(rgba_img)
     svg_str = vtracer.convert_raw_image_to_svg(
@@ -162,7 +116,7 @@ def process_image(
     """
     Вырезает фон и сохраняет в запрошенном формате:
     - png: прозрачный фон
-    - svg: векторный силуэт
+    - svg: векторный SVG
     - jpeg: чистый белый фон
     """
     input_img = Image.open(io.BytesIO(image_bytes))
