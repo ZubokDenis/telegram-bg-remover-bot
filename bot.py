@@ -6,7 +6,7 @@ Telegram-бот для удаления фона и конвертации фо�
 import asyncio
 import io
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -28,10 +28,10 @@ bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
 
-def detect_target_format(text: Optional[str]) -> Optional[str]:
-    """Определяет желаемый формат из подписи или возвращает None, если приписки нет."""
+def detect_target_format(text: Optional[str]) -> str:
+    """Определяет желаемый формат из подписи: svg, png, jpeg (по умолчанию png)."""
     if not text:
-        return None
+        return "png"
     text_lower = text.lower().strip()
     if "/svg" in text_lower or text_lower == "svg":
         return "svg"
@@ -39,7 +39,7 @@ def detect_target_format(text: Optional[str]) -> Optional[str]:
         return "jpeg"
     elif "/png" in text_lower or text_lower == "png":
         return "png"
-    return None
+    return "png"
 
 
 @dp.message(CommandStart())
@@ -48,7 +48,7 @@ async def cmd_start(message: Message):
     await message.answer("👌")
 
 
-async def extract_image_bytes(message: Message) -> Optional[bytes]:
+async def extract_image_bytes(message: Message, current_bot: Bot) -> Optional[bytes]:
     """Извлекает байты изображения из фото или документа."""
     file_id = None
     if message.photo:
@@ -59,23 +59,23 @@ async def extract_image_bytes(message: Message) -> Optional[bytes]:
     if not file_id:
         return None
 
-    file_info = await bot.get_file(file_id)
+    file_info = await current_bot.get_file(file_id)
     if not file_info.file_path:
         return None
 
-    downloaded = await bot.download_file(file_info.file_path)
-    return downloaded.read()
+    buf = io.BytesIO()
+    await current_bot.download_file(file_info.file_path, destination=buf)
+    return buf.getvalue()
 
 
 @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
-async def on_image_received(message: Message):
+async def on_image_received(message: Message, bot: Bot):
     """
     Обработка изображения:
-    - Без приписки: удаление фона (PNG).
-    - С припиской (/svg, /png, /jpeg): конвертация в нужный формат.
-    Никаких лишних текстовых сообщений, только итоговый файл.
+    - Вырезает фон и сохраняет в запрошенном формате (PNG по умолчанию, либо SVG / JPEG / PNG при приписке).
+    - Никакого текста, только итоговый файл.
     """
-    img_bytes = await extract_image_bytes(message)
+    img_bytes = await extract_image_bytes(message, bot)
     if not img_bytes:
         return
 
@@ -83,21 +83,12 @@ async def on_image_received(message: Message):
     target_format = detect_target_format(caption)
 
     try:
-        if target_format:
-            # Приписка есть -> делаем картинку в нужном формате
-            out_bytes, filename, mime_type = await asyncio.to_thread(
-                image_processor.convert_format,
-                img_bytes,
-                target_format
-            )
-        else:
-            # Приписки нет -> удаляем фон
-            out_bytes, filename, mime_type = await asyncio.to_thread(
-                image_processor.process_image,
-                img_bytes,
-                "png",
-                "auto"
-            )
+        out_bytes, filename, mime_type = await asyncio.to_thread(
+            image_processor.process_image,
+            img_bytes,
+            target_format,
+            "auto"
+        )
 
         input_file = BufferedInputFile(out_bytes, filename=filename)
 
@@ -111,22 +102,21 @@ async def on_image_received(message: Message):
 
 
 @dp.message(F.reply_to_message & (F.text.startswith("/") | F.text.in_({"svg", "png", "jpeg", "jpg"})))
-async def on_reply_format(message: Message):
+async def on_reply_format(message: Message, bot: Bot):
     """Ответ командой /svg, /png, /jpeg на ранее отправленное фото."""
-    target_format = detect_target_format(message.text)
-    if not target_format:
-        return
-
     replied = message.reply_to_message
-    img_bytes = await extract_image_bytes(replied)
+    img_bytes = await extract_image_bytes(replied, bot)
     if not img_bytes:
         return
 
+    target_format = detect_target_format(message.text)
+
     try:
         out_bytes, filename, mime_type = await asyncio.to_thread(
-            image_processor.convert_format,
+            image_processor.process_image,
             img_bytes,
-            target_format
+            target_format,
+            "auto"
         )
         input_file = BufferedInputFile(out_bytes, filename=filename)
 
@@ -135,7 +125,7 @@ async def on_reply_format(message: Message):
         else:
             await replied.answer_document(document=input_file)
     except Exception as e:
-        logger.exception("Ошибка при конвертации:")
+        logger.exception("Ошибка при обработке по реплаю:")
 
 
 async def main():

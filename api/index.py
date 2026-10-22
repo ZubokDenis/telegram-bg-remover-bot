@@ -7,16 +7,19 @@ import json
 import asyncio
 import os
 import sys
+import logging
 
-# Добавляем корневую директорию проекта в sys.path для корректных импортов
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
+from aiogram import Bot
 from aiogram.types import Update
-from bot import dp, bot
+from bot import dp
 import config
+
+logger = logging.getLogger("vercel_webhook")
 
 
 class handler(BaseHTTPRequestHandler):
@@ -29,7 +32,11 @@ class handler(BaseHTTPRequestHandler):
                     host = self.headers.get("Host", "")
                     webhook_url = f"https://{host}/api"
 
-                res = asyncio.run(bot.set_webhook(url=webhook_url, drop_pending_updates=True))
+                async def _set_wh():
+                    async with Bot(token=config.BOT_TOKEN) as current_bot:
+                        return await current_bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+
+                res = asyncio.run(_set_wh())
                 msg = f"Webhook успешно установлен на: {webhook_url} (Результат: {res})"
                 status_code = 200
             except Exception as e:
@@ -43,44 +50,25 @@ class handler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Telegram Background Removal Bot</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 60px 20px; background: #0d1117; color: #c9d1d9; }
-        .card { max-width: 500px; margin: 0 auto; background: #161b22; padding: 30px; border-radius: 12px; border: 1px solid #30363d; }
-        h1 { color: #58a6ff; font-size: 24px; }
-        .status { color: #3fb950; font-weight: bold; font-size: 18px; margin: 20px 0; }
-        a.btn { display: inline-block; background: #238636; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 15px; }
-        a.btn:hover { background: #2ea043; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>✂️ Telegram BG Removal Bot</h1>
-        <div class="status">🟢 Сервер работает 24/7 на Vercel!</div>
-        <p>Для привязки бота к этому серверу нажмите кнопку ниже:</p>
-        <a class="btn" href="?action=set_webhook">Привязать Telegram Webhook</a>
-    </div>
-</body>
-</html>"""
-        self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(b"OK")
 
     def do_POST(self):
         """Прием и обработка входящих сообщений (Update) от Telegram."""
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length)
 
+        async def _handle():
+            async with Bot(token=config.BOT_TOKEN) as current_bot:
+                update_data = json.loads(post_data.decode("utf-8"))
+                update = Update.model_validate(update_data, context={"bot": current_bot})
+                await dp.feed_update(current_bot, update)
+
         try:
-            update_data = json.loads(post_data.decode("utf-8"))
-            update = Update.model_validate(update_data, context={"bot": bot})
-            asyncio.run(dp.feed_update(bot, update))
+            asyncio.run(_handle())
         except Exception as e:
-            print(f"Ошибка при обработке вебхука: {e}")
+            logger.exception("Ошибка при обработке вебхука:")
 
         self.send_response(200)
         self.send_header("Content-type", "application/json")
