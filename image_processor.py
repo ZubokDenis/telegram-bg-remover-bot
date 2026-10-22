@@ -1,7 +1,6 @@
 """
 Модуль качественного удаления фона и конвертации форматов (PNG, SVG, JPEG).
-Использует высокоточную легковесную модель u2netp (rembg) с плавным откатом
-к колориметрическому алгоритму CIELAB при необходимости.
+Использует встроенную локальную модель u2netp (rembg) без необходимости скачивания из сети.
 """
 
 import os
@@ -13,20 +12,17 @@ from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
-# Для Serverless-сред (Vercel) настраиваем сохранение моделей в доступную для записи папку /tmp
-os.environ["U2NET_HOME"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), ".u2net")
+# Пути к локальным моделям внутри проекта
+current_dir = os.path.dirname(os.path.abspath(__file__))
+models_dir = os.path.join(current_dir, "models")
 
-# Инициализируем rembg
-HAS_REMBG = False
-REMBG_SESSION = None
+# Настраиваем пути поиска для rembg
+os.environ["U2NET_HOME"] = models_dir
+os.environ["REMBG_HOME"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), "rembg")
 
-try:
-    import rembg
-    REMBG_SESSION = rembg.new_session("u2netp")
-    HAS_REMBG = True
-    logger.info("Модель u2netp (rembg) успешно инициализирована")
-except Exception as e:
-    logger.warning(f"rembg не загружен, будет использован колориметрический алгоритм: {e}")
+# Глобальная переменная для сессии rembg
+_REMBG_SESSION = None
+_REMBG_INITIALIZED = False
 
 # Проверяем доступность OpenCV
 try:
@@ -43,16 +39,34 @@ except ImportError:
     HAS_VTRACER = False
 
 
+def get_rembg_session():
+    """Ленивая загрузка сессии rembg из локального файла u2netp.onnx."""
+    global _REMBG_SESSION, _REMBG_INITIALIZED
+    if _REMBG_INITIALIZED:
+        return _REMBG_SESSION
+
+    _REMBG_INITIALIZED = True
+    try:
+        import rembg
+        # Убеждаемся, что U2NET_HOME указывает на локальную папку models
+        os.environ["U2NET_HOME"] = models_dir
+        _REMBG_SESSION = rembg.new_session("u2netp")
+        logger.info("Локальная модель u2netp успешно загружена")
+    except Exception as e:
+        logger.exception(f"Не удалось загрузить модель rembg: {e}")
+        _REMBG_SESSION = None
+
+    return _REMBG_SESSION
+
+
 def remove_bg_cielab(img_pil: Image.Image, threshold: float = 24.0, feather: float = 1.5) -> Image.Image:
     """
-    Качественное удаление однородного/градиентного фона в цветовом пространстве CIELAB.
-    Определяет фон по углам изображения и удаляет его со всех пустот между ветками и деталями.
+    Резервное удаление фона по цветовому расстоянию в пространстве CIELAB.
     """
     rgb = img_pil.convert("RGB")
     arr = np.array(rgb)
     h, w, _ = arr.shape
 
-    # 4 угловых патча для определения фонового цвета
     p_size = max(3, min(w, h) // 40)
     patches = [
         arr[:p_size, :p_size],
@@ -86,23 +100,23 @@ def remove_bg_cielab(img_pil: Image.Image, threshold: float = 24.0, feather: flo
 
 def remove_background(pil_image: Image.Image) -> Image.Image:
     """
-    Главная функция вырезания фона.
-    В первую очередь использует специализированную модель сегментации (rembg),
-    которая безошибочно вырезает ветки, листья, корни, волосы и сложные контуры.
+    Удаляет фон с изображения.
+    Использует локальную модель u2netp (rembg) с откатом к CIELAB.
     """
-    global HAS_REMBG, REMBG_SESSION
-
-    if HAS_REMBG and REMBG_SESSION:
+    session = get_rembg_session()
+    if session is not None:
         try:
-            return rembg.remove(pil_image, session=REMBG_SESSION)
+            import rembg
+            return rembg.remove(pil_image, session=session)
         except Exception as e:
-            logger.exception("Ошибка rembg, переключаюсь на CIELAB:")
+            logger.exception(f"Ошибка при работе rembg: {e}")
 
+    logger.warning("Используется резервный алгоритм CIELAB")
     return remove_bg_cielab(pil_image)
 
 
 def to_png_bytes(rgba_img: Image.Image) -> bytes:
-    """Сохраняет RGBA изображение в формат PNG с прозрачностью."""
+    """Сохраняет RGBA изображение в формат PNG с поддержкой прозрачности."""
     buf = io.BytesIO()
     rgba_img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
