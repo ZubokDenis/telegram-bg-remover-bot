@@ -1,6 +1,6 @@
 aiogram>=3.14.0
 pillow>=10.0.0
 numpy>=1.26.0
-opencv-python-headless>=4.8.0
 vtracer>=0.6.15
 python-dotenv>=1.0.0
+gradio_client>=2.7.0

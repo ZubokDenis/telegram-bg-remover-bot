@@ -1,14 +1,14 @@
 """
-Модуль надежного и быстрого удаления фона и конвертации в PNG, SVG, JPEG.
-Работает на чистом Pillow/NumPy без перегруженных библиотек и тяжелых моделей.
+Модуль высококачественного удаления фона и конвертации изображений.
+Использует нейросеть BRIA RMBG-2.0 / 1.4 через Hugging Face с бесшовным локальным фоллбэком.
 """
 
 import os
 import io
 import time
 import logging
+import tempfile
 from typing import Tuple, Optional
-import requests
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -24,36 +24,66 @@ except ImportError:
     HAS_VTRACER = False
     logger.warning("vtracer не обнаружен, векторизация SVG будет недоступна")
 
+# Глобальные клиенты для повторного использования (ускоряет инференс)
+_client_rmbg2 = None
+_client_rmbg1 = None
 
-def remove_background_hf(image_bytes: bytes, token: str) -> Optional[Image.Image]:
-    """
-    Отправляет изображение в официальный бесплатный Serverless-эндпоинт модели briaai/RMBG-1.4 на Hugging Face.
-    Возвращает изображение высочайшего студийного качества с прозрачным альфа-каналом.
-    """
-    urls = [
-        "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4",
-        "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
-    ]
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/octet-stream",
-    }
 
-    for url in urls:
+def get_rmbg2_client(token: str):
+    global _client_rmbg2
+    if _client_rmbg2 is None:
+        from gradio_client import Client
+        _client_rmbg2 = Client("briaai/BRIA-RMBG-2.0", token=token)
+    return _client_rmbg2
+
+
+def get_rmbg1_client(token: str):
+    global _client_rmbg1
+    if _client_rmbg1 is None:
+        from gradio_client import Client
+        _client_rmbg1 = Client("briaai/BRIA-RMBG-1.4", token=token)
+    return _client_rmbg1
+
+
+def remove_background_neural(pil_image: Image.Image, token: str) -> Optional[Image.Image]:
+    """
+    Отправляет изображение в нейросеть RMBG-2.0 / RMBG-1.4 на Hugging Face.
+    Возвращает изображение студийного качества с прозрачным фоном.
+    """
+    from gradio_client import handle_file
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        pil_image.save(tmp.name, format="PNG")
+        tmp_path = tmp.name
+
+    try:
+        # 1. Сначала пробуем лучшую современную модель RMBG-2.0
         try:
-            r = requests.post(url, headers=headers, data=image_bytes, timeout=30)
-            if r.status_code == 200:
-                return Image.open(io.BytesIO(r.content)).convert("RGBA")
-            elif r.status_code == 503:
-                # Если модель на сервере Hugging Face прогревается (cold start)
-                time.sleep(2)
-                r = requests.post(url, headers=headers, data=image_bytes, timeout=30)
-                if r.status_code == 200:
-                    return Image.open(io.BytesIO(r.content)).convert("RGBA")
-            else:
-                logger.warning(f"Hugging Face ({url}) статус {r.status_code}: {r.text[:200]}")
+            client2 = get_rmbg2_client(token)
+            res = client2.predict(image=handle_file(tmp_path), api_name="/image")
+            # res: (slider_tuple, filepath)
+            out_file = res[1]
+            if out_file and os.path.exists(out_file):
+                return Image.open(out_file).convert("RGBA")
         except Exception as e:
-            logger.warning(f"Ошибка запроса к {url}: {e}")
+            logger.warning(f"RMBG-2.0 ошибка: {e}. Пробуем RMBG-1.4...")
+
+        # 2. Если RMBG-2.0 недоступен, пробуем стабильный RMBG-1.4
+        try:
+            client1 = get_rmbg1_client(token)
+            res = client1.predict(image=handle_file(tmp_path), api_name="/run")
+            out_file = res[1]
+            if out_file and os.path.exists(out_file):
+                return Image.open(out_file).convert("RGBA")
+        except Exception as e:
+            logger.warning(f"RMBG-1.4 ошибка: {e}")
+
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
     return None
 
@@ -63,17 +93,15 @@ def remove_background_local(
     threshold: float = 38.0
 ) -> Image.Image:
     """
-    Удаляет фон с изображения:
-    1. Находит фоновые цвета по 4 углам и строит билинейную плоскость градиента фона.
-    2. Вычисляет взвешенное цветовое расстояние (человеческое восприятие).
-    3. Применяет алгоритм Matte Choke (MinFilter) для полного удаления краевого ореола.
-    4. Делает микросглаживание контура.
+    Резервный локальный алгоритм удаления фона (на случай оффлайна или проблем с сетью):
+    1. Находит фоновые цвета по 4 углам и строит билинейную плоскость фона.
+    2. Вычисляет цветовое расстояние с учетом человеческого восприятия.
+    3. Применяет Matte Choke (MinFilter) для срезки краевого ореола.
     """
     rgb = pil_image.convert("RGB")
     arr = np.array(rgb, dtype=np.float32)
     h, w, _ = arr.shape
 
-    # Угловые области (размером примерно 3-5% от картинки)
     c_size = max(5, min(w, h) // 30)
 
     tl = np.median(arr[:c_size, :c_size].reshape(-1, 3), axis=0)
@@ -81,27 +109,21 @@ def remove_background_local(
     bl = np.median(arr[-c_size:, :c_size].reshape(-1, 3), axis=0)
     br = np.median(arr[-c_size:, -c_size:].reshape(-1, 3), axis=0)
 
-    # Билинейная плоскость фона (компенсирует градиенты, тени и виньетирование)
     u = np.linspace(0.0, 1.0, w, endpoint=True, dtype=np.float32).reshape(1, w, 1)
     v = np.linspace(0.0, 1.0, h, endpoint=True, dtype=np.float32).reshape(h, 1, 1)
     top_line = (1.0 - u) * tl + u * tr
     bot_line = (1.0 - u) * bl + u * br
     bg_plane = (1.0 - v) * top_line + v * bot_line
 
-    # Взвешенное цветовое расстояние
     diff = arr - bg_plane
     dist = np.sqrt(2.0 * diff[:, :, 0]**2 + 4.0 * diff[:, :, 1]**2 + 3.0 * diff[:, :, 2]**2)
 
-    # Крутой и четкий порог
     t_low = max(5.0, threshold - 6.0)
     t_high = threshold + 6.0
     alpha = np.clip((dist - t_low) / (t_high - t_low) * 255.0, 0, 255).astype(np.uint8)
 
-    # Убираем ореол и краевую кайму (Matte Choke)
     alpha_pil = Image.fromarray(alpha, mode="L")
     alpha_eroded = alpha_pil.filter(ImageFilter.MinFilter(3))
-
-    # Микросглаживание контура (0.6px)
     alpha_final = alpha_eroded.filter(ImageFilter.GaussianBlur(0.6))
 
     result = rgb.copy()
@@ -112,21 +134,18 @@ def remove_background_local(
 def remove_background(pil_image: Image.Image) -> Image.Image:
     """
     Главная функция вырезания фона:
-    1. Если задан HF_TOKEN, использует передовую нейросеть briaai/RMBG-1.4 (студийное качество 10/10).
-    2. В случае отсутствия токена или сетевой ошибки бесшовно переключается на локальный алгоритм.
+    При наличии HF_TOKEN запускает нейросеть студийного качества,
+    при сбое мягко переключается на локальный алгоритм.
     """
     if config.HF_TOKEN:
         try:
-            buf = io.BytesIO()
-            pil_image.save(buf, format="PNG")
-            hf_res = remove_background_hf(buf.getvalue(), config.HF_TOKEN)
-            if hf_res is not None:
-                return hf_res
+            res = remove_background_neural(pil_image, config.HF_TOKEN)
+            if res is not None:
+                return res
         except Exception as e:
-            logger.warning(f"Ошибка при вызове нейросети RMBG: {e}")
+            logger.warning(f"Ошибка нейросетевой обработки: {e}")
 
     return remove_background_local(pil_image)
-
 
 
 def to_png_bytes(rgba_img: Image.Image) -> bytes:
