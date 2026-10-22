@@ -23,15 +23,14 @@ except ImportError:
 
 def remove_background(
     pil_image: Image.Image,
-    threshold: float = 24.0,
-    feather_radius: float = 1.0
+    threshold: float = 38.0
 ) -> Image.Image:
     """
     Удаляет фон с изображения:
-    1. Находит фоновый цвет по угловым областям.
-    2. Вычисляет взвешенное цветовое расстояние (с учетом чувствительности человеческого глаза).
-    3. Формирует плавный альфа-канал с мягким сглаживанием краев.
-    Сохраняет 100% деталей объекта (ствол, ветки, листья) и полностью удаляет фон.
+    1. Находит фоновые цвета по 4 углам и строит билинейную плоскость градиента фона.
+    2. Вычисляет взвешенное цветовое расстояние (человеческое восприятие).
+    3. Применяет алгоритм Matte Choke (MinFilter) для полного удаления краевого ореола.
+    4. Делает микросглаживание контура.
     """
     rgb = pil_image.convert("RGB")
     arr = np.array(rgb, dtype=np.float32)
@@ -39,33 +38,37 @@ def remove_background(
 
     # Угловые области (размером примерно 3-5% от картинки)
     c_size = max(5, min(w, h) // 30)
-    c1 = arr[:c_size, :c_size].reshape(-1, 3)
-    c2 = arr[:c_size, -c_size:].reshape(-1, 3)
-    c3 = arr[-c_size:, :c_size].reshape(-1, 3)
-    c4 = arr[-c_size:, -c_size:].reshape(-1, 3)
-    corners = np.concatenate([c1, c2, c3, c4], axis=0)
 
-    # Определяем медианный цвет фона
-    bg_color = np.median(corners, axis=0)
+    tl = np.median(arr[:c_size, :c_size].reshape(-1, 3), axis=0)
+    tr = np.median(arr[:c_size, -c_size:].reshape(-1, 3), axis=0)
+    bl = np.median(arr[-c_size:, :c_size].reshape(-1, 3), axis=0)
+    br = np.median(arr[-c_size:, -c_size:].reshape(-1, 3), axis=0)
 
-    # Взвешенное цветовое расстояние (человеческий глаз наиболее чувствителен к зеленому, затем к красному, затем к синему)
-    dr = arr[:, :, 0] - bg_color[0]
-    dg = arr[:, :, 1] - bg_color[1]
-    db = arr[:, :, 2] - bg_color[2]
-    dist = np.sqrt(2.0 * dr**2 + 4.0 * dg**2 + 3.0 * db**2)
+    # Билинейная плоскость фона (компенсирует градиенты, тени и виньетирование)
+    u = np.linspace(0.0, 1.0, w, endpoint=True, dtype=np.float32).reshape(1, w, 1)
+    v = np.linspace(0.0, 1.0, h, endpoint=True, dtype=np.float32).reshape(h, 1, 1)
+    top_line = (1.0 - u) * tl + u * tr
+    bot_line = (1.0 - u) * bl + u * br
+    bg_plane = (1.0 - v) * top_line + v * bot_line
 
-    # Плавная граница перехода (soft alpha)
-    t_low = max(4.0, threshold - 8.0)
-    t_high = threshold + 8.0
+    # Взвешенное цветовое расстояние
+    diff = arr - bg_plane
+    dist = np.sqrt(2.0 * diff[:, :, 0]**2 + 4.0 * diff[:, :, 1]**2 + 3.0 * diff[:, :, 2]**2)
+
+    # Крутой и четкий порог
+    t_low = max(5.0, threshold - 6.0)
+    t_high = threshold + 6.0
     alpha = np.clip((dist - t_low) / (t_high - t_low) * 255.0, 0, 255).astype(np.uint8)
 
-    # Сглаживание краев
+    # Убираем ореол и краевую кайму (Matte Choke)
     alpha_pil = Image.fromarray(alpha, mode="L")
-    if feather_radius > 0:
-        alpha_pil = alpha_pil.filter(ImageFilter.GaussianBlur(feather_radius))
+    alpha_eroded = alpha_pil.filter(ImageFilter.MinFilter(3))
+
+    # Микросглаживание контура (0.6px)
+    alpha_final = alpha_eroded.filter(ImageFilter.GaussianBlur(0.6))
 
     result = rgb.copy()
-    result.putalpha(alpha_pil)
+    result.putalpha(alpha_final)
     return result
 
 
